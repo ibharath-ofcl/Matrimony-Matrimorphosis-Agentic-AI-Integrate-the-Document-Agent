@@ -13,6 +13,7 @@ functions for blocking calls (time.sleep, httpx.get/Client, requests, sqlite3.co
 Only the paths moved (data/ in this project, cache under 'session5-agent'). Charts are written to CHARTS_DIR
 and served by the API at /charts so the Gradio UI can show them.
 """
+import asyncio
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import uuid
 from pathlib import Path
 
 import altair as alt
+import httpx
 import openml
 import pandas as pd
 import platformdirs
@@ -85,7 +87,7 @@ def reject_unless_select_only(query: str) -> str | None:
 # Tool 1 — weather (toy, no real API — mirrors the slide's exact example)
 # ---------------------------------------------------------------------------
 @tool
-def get_weather(location: str) -> str:
+async def get_weather(location: str) -> str:
     """Get current weather for a location.
 
     Args:
@@ -98,17 +100,25 @@ def get_weather(location: str) -> str:
 # Tool 2 — web fetch -> clean markdown
 # ---------------------------------------------------------------------------
 @tool
-def web_fetch(url: str) -> str:
+async def web_fetch(url: str) -> str:
     """Fetch a web page and return its main content as clean Markdown,
     with navigation, ads, and boilerplate stripped out.
 
     Args:
         url: Full URL of the page to fetch (e.g. https://example.com/article)
     """
-    downloaded = trafilatura.fetch_url(url)
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url)
+            if resp.status_code >= 400:
+                return f"Could not fetch {url}"
+            downloaded = resp.text
+    except Exception:
+        return f"Could not fetch {url}"
+
     if not downloaded:
         return f"Could not fetch {url}"
-    markdown = trafilatura.extract(downloaded, output_format="markdown", with_metadata=True)
+    markdown = await asyncio.to_thread(trafilatura.extract, downloaded, output_format="markdown", with_metadata=True)
     if not markdown:
         return f"Fetched {url} but found no extractable article content."
     return markdown[:8000]  # keep the demo output readable
@@ -117,8 +127,18 @@ def web_fetch(url: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool 3 — SQL query against a toy database (read-only)
 # ---------------------------------------------------------------------------
+def _run_sql(db_path: Path, stripped: str) -> list[dict]:
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(stripped).fetchall()
+        return [dict(row) for row in rows[:200]]  # cap rows for the demo
+    finally:
+        con.close()
+
+
 @tool
-def sql_query(database: str, query: str) -> str:
+async def sql_query(database: str, query: str) -> str:
     """Run a read-only SQL SELECT query against one of the toy databases.
 
     Returns a JSON object: {"data_ref": ..., "row_count": ..., "preview": [...]}.
@@ -147,15 +167,10 @@ def sql_query(database: str, query: str) -> str:
     if rejection:
         return rejection
     stripped = query.strip().rstrip(";")
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
     try:
-        rows = con.execute(stripped).fetchall()
+        result = await asyncio.to_thread(_run_sql, db_path, stripped)
     except sqlite3.Error as e:
         return f"SQL error: {e}"
-    finally:
-        con.close()
-    result = [dict(row) for row in rows[:200]]  # cap rows for the demo
     ref = _cache_rows(result)
     return json.dumps({"data_ref": ref, "row_count": len(result), "preview": result[:20]}, default=str)
 
